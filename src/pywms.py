@@ -5,6 +5,7 @@ import socket
 import threading
 import sys
 import time
+import shlex
 
 #import Image
 #
@@ -15,22 +16,73 @@ import time
 #im = Image.open( "test.gif" )
 #print im
 
-class StatusMonitoringThread( threading.Thread ):
+def parse_separated_string( string, delim ):
+    splitter = shlex.shlex( string, posix = True )
+    splitter.whitespace = delim
+    splitter.whitespace_split = True
+    return list( splitter )
+
+class SocketLineReader():
+
+    def __init__( self, sock ):
+        self.sock = sock
+
+    def __iter__( self ):
+        return self
+
+    def next( self ):
+        buffer = ""
+        while True:
+            data = self.sock.recv( 1 )
+            if data == "":
+                raise StopIteration
+            if data != '\n':
+                buffer = "%s%s" % ( buffer, data )
+            else:
+                break
+        return buffer
+
+class PacketReader():
+
+    def __init__( self, sock ):
+        self.sock = sock
+        self.reader = SocketLineReader( sock )
+
+    def __iter__( self ):
+        return self
+
+    def next( self ):
+        packet = []
+        while True:
+            line = None
+            try:
+                line = self.reader.next()
+                line = line.strip()
+            except StopIteration:
+                break
+            if line != '':
+                packet.append( line )
+            else:
+                break
+        return packet
+
+class StatusThread( threading.Thread ):
 
     def __init__( self, params, output_lock, params_lock ):
         threading.Thread.__init__( self )
-        self.params, self.is_finish, self.old_status = params, False, None
+        self.params, self.old_status = params, None
         self.output_lock, self.params_lock = output_lock, params_lock
         self.params_lock.acquire()
         self.is_verbose = self.params[ 'is-verbose' ]
+        self.is_finish = self.params[ 'is-finish' ]
         self.params_lock.release()
 
     def run( self ):
         while not self.is_finish:
-            time.sleep( 5 )
             self.params_lock.acquire()
             self.is_finish = self.params[ 'is-finish' ]
             self.params_lock.release()
+            time.sleep( 5 )
 
 class ConnectionsThread( threading.Thread ):
 
@@ -40,30 +92,62 @@ class ConnectionsThread( threading.Thread ):
         self.output_lock, self.params_lock = output_lock, params_lock
         self.params_lock.acquire()
         self.is_verbose = self.params[ 'is-verbose' ]
+        self.is_finish = self.params[ 'is-finish' ]
         self.host, self.port = self.params[ 'host' ], self.params[ 'port' ]
         self.params_lock.release()
 
     def run( self ):
-        while self.is_verbose:
+        while not self.is_finish:
             time.sleep( 5 )
-            s = socket.socket( socket.AF_INET, socket.SOCK_STREAM )
-            s.bind( ( self.host, self.port ) )
-            s.listen( 1 )
-            conn, addr = s.accept()
-            print 'Connected by', addr
+            sock = socket.socket( socket.AF_INET, socket.SOCK_STREAM )
+            sock.bind( ( self.host, self.port ) )
+            sock.listen( 1 )
+            client_conn, client_addr = sock.accept()
+            self.params_lock.acquire()
+            self.params[ 'clients-to-start' ].append( ( client_conn, client_addr ) )
+            self.params_lock.release()
+            print "connect with %s:%s" % client_addr
 
-            while 1:
-                data = conn.recv( 1024 )
-                if not data:
-                    break
-                print data
-            #    conn.send(data)
+class InputThread( threading.Thread ):
 
-            conn.close()
+    def __init__( self, client_sock, params, output_lock, params_lock ):
+        threading.Thread.__init__( self )
+        self.client_sock = client_sock
+        self.params = params
+        self.output_lock, self.params_lock = output_lock, params_lock
+        self.params_lock.acquire()
+        self.is_verbose = self.params[ 'is-verbose' ]
+        self.is_finish = self.params[ 'is-finish' ]
+        self.params_lock.release()
 
-class RequestProcessingThread( threading.Thread ):
+    def process_packet( self, packet ):
+        p = {}
+        header = packet[0]
+        header = parse_separated_string( header, ' ' )
+        p[ 'type' ] = header[0]
+        p[ 'url' ] = header[1]
+        p[ 'version' ] = header[2]
+        p[ 'flags' ] = {}
+        packet = packet[1:]
+        for item in packet:
+            item = parse_separated_string( item, ': ' )
+            p[ 'flags' ][ item[0] ] = item[1]
+        return p
 
-    old_status = None
+    def run( self ):
+        reader = PacketReader( self.client_sock )
+        while not self.is_finish:
+            packet = reader.next()
+            if not packet:
+                break
+            packet = self.process_packet( packet )
+            print "Packet: %s" % packet
+            self.params_lock.acquire()
+            self.params[ 'input-pool' ][  self.client_sock ].append( packet )
+            self.is_finish = self.params[ 'is-finish' ]
+            self.params_lock.release()
+
+class ProcessingThread( threading.Thread ):
 
     def __init__( self, params, output_lock, params_lock ):
         threading.Thread.__init__( self )
@@ -71,46 +155,37 @@ class RequestProcessingThread( threading.Thread ):
         self.output_lock, self.params_lock = output_lock, params_lock
         self.params_lock.acquire()
         self.is_verbose = self.params[ 'is-verbose' ]
+        self.is_finish = self.params[ 'is-finish' ]
         self.params_lock.release()
-        self.old_status = None
 
     def run( self ):
-        while self.is_verbose:
+        while not self.is_finish:
+
             time.sleep( 5 )
 
-class ResponsePrepareThread( threading.Thread ):
+            self.params_lock.acquire()
+            self.is_finish = self.params[ 'is-finish' ]
+            self.params_lock.release()
 
-    old_status = None
+class OutputThread( threading.Thread ):
 
-    def __init__( self, params, output_lock, params_lock ):
+    def __init__( self, client_sock, params, output_lock, params_lock ):
         threading.Thread.__init__( self )
+        self.client_sock = client_sock
         self.params = params
         self.output_lock, self.params_lock = output_lock, params_lock
         self.params_lock.acquire()
         self.is_verbose = self.params[ 'is-verbose' ]
+        self.is_finish = self.params[ 'is-finish' ]
         self.params_lock.release()
-        self.old_status = None
 
     def run( self ):
-        while self.is_verbose:
+        while not self.is_finish:
             time.sleep( 5 )
 
-class ResponseProcessingThread( threading.Thread ):
-
-    old_status = None
-
-    def __init__( self, params, output_lock, params_lock ):
-        threading.Thread.__init__( self )
-        self.params = params
-        self.output_lock, self.params_lock = output_lock, params_lock
-        self.params_lock.acquire()
-        self.is_verbose = self.params[ 'is-verbose' ]
-        self.params_lock.release()
-        self.old_status = None
-
-    def run( self ):
-        while self.is_verbose:
-            time.sleep( 5 )
+            self.params_lock.acquire()
+            self.is_finish = self.params[ 'is-finish' ]
+            self.params_lock.release()
 
 if __name__ == "__main__":
     import optparse
@@ -120,7 +195,7 @@ if __name__ == "__main__":
 
     option_list = [
         optparse.make_option( "--host", dest = "host", type = "string", help = "wms host" ),
-        optparse.make_option( "--host", dest = "port", type = "string", help = "wms port" ),
+        optparse.make_option( "--port", dest = "port", type = "string", help = "wms port" ),
         ]
     usage = "usage: %prog [options] arg1 arg2"
     optparser = OptionParser( usage = usage, option_list = option_list )
@@ -128,9 +203,11 @@ if __name__ == "__main__":
 
     params = {
       'host' : '127.0.0.1',
-      'port' : '50007',
-      'requests' : [],
-      'connection-pool' : [],
+      'port' : 50007,
+      'clients' : {},
+      'clients-to-start' : [],
+      'input-pool' : {},
+      'output-pool' : {},
       'is-verbose' : False,
       'is-finish' : False
     }
@@ -138,29 +215,50 @@ if __name__ == "__main__":
     if options.host:
         params[ 'host' ] = options.host
     if options.port:
-        params[ 'port' ] = options.port
+        params[ 'port' ] = int( options.port )
 
     output_lock = threading.Lock()
     params_lock = threading.Lock()
 
     sys.stderr.write( "started\n" )
-    status_thread = StatusMonitoringThread( params, output_lock, params_lock )
+    status_thread = StatusThread( params, output_lock, params_lock )
     status_thread.setName( "status" )
+    status_thread.start()
+    status_thread = ConnectionsThread( params, output_lock, params_lock )
+    status_thread.setName( "connect" )
     status_thread.start()
 
     is_finish = False
 
-    while True:
+    while not is_finish:
+        client_connection, client_address = None, None
         params_lock.acquire()
+        if len( params[ 'clients-to-start' ] ) > 0:
+            client_connection, client_address = params[ 'clients-to-start' ].pop()
         params_lock.release()
+        if client_connection:
+            input_thread = InputThread( client_connection, params, output_lock, params_lock )
+            input_thread.setName( "input %s:%s" % client_address )
+            input_thread.start()
 
-#        output_lock.acquire()
-#        print is_areas_empty, download_thread_count, is_download_finish, is_start_new_download, is_data_empty, separate_thread_count, is_separate_finish, is_start_new_separate 
-#        output_lock.release()
+            process_thread = ProcessingThread( client_connection, params, output_lock, params_lock )
+            process_thread.setName( "process %s:%s" % client_address )
+            process_thread.start()
 
-        if is_finish:
-            break
-        time.sleep( 1 )
+            output_thread = OutputThread( client_connection, params, output_lock, params_lock )
+            output_thread.setName( "output %s:%s" % client_address )
+            output_thread.start()
+
+            params_lock.acquire()
+            params[ 'clients' ][ client_address ] = ( client_connection, input_thread, process_thread, output_thread )
+            params[ 'sockets' ][ client_connection ] = client_address
+            params[ 'input-pool' ][ client_connection ] = []
+            params[ 'output-pool' ][ client_connection ] = []
+            params_lock.release()
+
+        params_lock.acquire()
+        is_finish = params[ 'is-finish' ]
+        params_lock.release()
 
     params_lock.acquire()
     params[ 'is-finish' ] = True
