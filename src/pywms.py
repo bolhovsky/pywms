@@ -22,6 +22,10 @@ def parse_separated_string( string, delim ):
     splitter.whitespace_split = True
     return list( splitter )
 
+def get_capabilities():
+    capabilities = ""
+    return capabilities
+
 class SocketLineReader():
 
     def __init__( self, sock ):
@@ -98,27 +102,24 @@ class ConnectionsThread( threading.Thread ):
 
     def run( self ):
         while not self.is_finish:
-            time.sleep( 5 )
             sock = socket.socket( socket.AF_INET, socket.SOCK_STREAM )
             sock.bind( ( self.host, self.port ) )
             sock.listen( 1 )
             client_conn, client_addr = sock.accept()
             self.params_lock.acquire()
-            self.params[ 'clients-to-start' ].append( ( client_conn, client_addr ) )
+            self.params[ 'connection-pool' ].append( ( client_conn, client_addr ) )
             self.params_lock.release()
             print "connect with %s:%s" % client_addr
 
-class InputThread( threading.Thread ):
+class ProcessThread( threading.Thread ):
 
-    def __init__( self, client_sock, params, output_lock, params_lock ):
+    def __init__( self, client_connection, client_address, params, output_lock, params_lock ):
+        print "create thread"
         threading.Thread.__init__( self )
-        self.client_sock = client_sock
+        self.client_sock = client_connection
+        self.client_address = client_address
         self.params = params
         self.output_lock, self.params_lock = output_lock, params_lock
-        self.params_lock.acquire()
-        self.is_verbose = self.params[ 'is-verbose' ]
-        self.is_finish = self.params[ 'is-finish' ]
-        self.params_lock.release()
 
     def process_packet( self, packet ):
         p = {}
@@ -134,58 +135,41 @@ class InputThread( threading.Thread ):
             p[ 'flags' ][ item[0] ] = item[1]
         return p
 
-    def run( self ):
-        reader = PacketReader( self.client_sock )
-        while not self.is_finish:
-            packet = reader.next()
-            if not packet:
+    def parse_param( self, string ):
+        result = {}
+        p = string.find( '=' )
+        if p != -1:
+            result = { string[ :p ]: string[ p + 1: ] }
+        return result
+
+    def parse_url( self, url_string ):
+        result = {}
+        url = url_string[:url_string.find( '?' )]
+        params_string = url_string[url_string.find( '?' ) + 1:]
+        while True:
+            p = params_string.find( '&', 0 )
+            if p == -1:
                 break
+            s = params_string[:p]
+            params_string = params_string[p + 1:]
+            result.update( self.parse_param( s ) )
+        result.update( self.parse_param( params_string ) )
+        print url, '\n', result
+        return result
+
+    def run( self ):
+        print "start thread"
+        self.params_lock.acquire()
+        self.is_verbose = self.params[ 'is-verbose' ]
+        self.is_finish = self.params[ 'is-finish' ]
+        self.params_lock.release()
+        reader = PacketReader( self.client_sock )
+        packet = reader.next()
+        if packet:
             packet = self.process_packet( packet )
-            print "Packet: %s" % packet
-            self.params_lock.acquire()
-            self.params[ 'input-pool' ][  self.client_sock ].append( packet )
-            self.is_finish = self.params[ 'is-finish' ]
-            self.params_lock.release()
+            #print "Packet: %s\n%s" % ( self.client_address, packet )
+            url_parts = self.parse_url( packet[ 'url' ] )
 
-class ProcessingThread( threading.Thread ):
-
-    def __init__( self, params, output_lock, params_lock ):
-        threading.Thread.__init__( self )
-        self.params = params
-        self.output_lock, self.params_lock = output_lock, params_lock
-        self.params_lock.acquire()
-        self.is_verbose = self.params[ 'is-verbose' ]
-        self.is_finish = self.params[ 'is-finish' ]
-        self.params_lock.release()
-
-    def run( self ):
-        while not self.is_finish:
-
-            time.sleep( 5 )
-
-            self.params_lock.acquire()
-            self.is_finish = self.params[ 'is-finish' ]
-            self.params_lock.release()
-
-class OutputThread( threading.Thread ):
-
-    def __init__( self, client_sock, params, output_lock, params_lock ):
-        threading.Thread.__init__( self )
-        self.client_sock = client_sock
-        self.params = params
-        self.output_lock, self.params_lock = output_lock, params_lock
-        self.params_lock.acquire()
-        self.is_verbose = self.params[ 'is-verbose' ]
-        self.is_finish = self.params[ 'is-finish' ]
-        self.params_lock.release()
-
-    def run( self ):
-        while not self.is_finish:
-            time.sleep( 5 )
-
-            self.params_lock.acquire()
-            self.is_finish = self.params[ 'is-finish' ]
-            self.params_lock.release()
 
 if __name__ == "__main__":
     import optparse
@@ -205,7 +189,7 @@ if __name__ == "__main__":
       'host' : '127.0.0.1',
       'port' : 50007,
       'clients' : {},
-      'clients-to-start' : [],
+      'connection-pool' : [],
       'input-pool' : {},
       'output-pool' : {},
       'is-verbose' : False,
@@ -224,37 +208,22 @@ if __name__ == "__main__":
     status_thread = StatusThread( params, output_lock, params_lock )
     status_thread.setName( "status" )
     status_thread.start()
-    status_thread = ConnectionsThread( params, output_lock, params_lock )
-    status_thread.setName( "connect" )
-    status_thread.start()
+    connection_thread = ConnectionsThread( params, output_lock, params_lock )
+    connection_thread.setName( "connect" )
+    connection_thread.start()
 
     is_finish = False
 
     while not is_finish:
+#        time.sleep( 1 )
         client_connection, client_address = None, None
         params_lock.acquire()
-        if len( params[ 'clients-to-start' ] ) > 0:
-            client_connection, client_address = params[ 'clients-to-start' ].pop()
-        params_lock.release()
-        if client_connection:
-            input_thread = InputThread( client_connection, params, output_lock, params_lock )
-            input_thread.setName( "input %s:%s" % client_address )
-            input_thread.start()
-
-            process_thread = ProcessingThread( client_connection, params, output_lock, params_lock )
+        if len( params[ 'connection-pool' ] ) > 0:
+            client_connection, client_address = params[ 'connection-pool' ].pop()
+            process_thread = ProcessThread( client_connection, client_address, params, output_lock, params_lock )
             process_thread.setName( "process %s:%s" % client_address )
             process_thread.start()
-
-            output_thread = OutputThread( client_connection, params, output_lock, params_lock )
-            output_thread.setName( "output %s:%s" % client_address )
-            output_thread.start()
-
-            params_lock.acquire()
-            params[ 'clients' ][ client_address ] = ( client_connection, input_thread, process_thread, output_thread )
-            params[ 'sockets' ][ client_connection ] = client_address
-            params[ 'input-pool' ][ client_connection ] = []
-            params[ 'output-pool' ][ client_connection ] = []
-            params_lock.release()
+        params_lock.release()
 
         params_lock.acquire()
         is_finish = params[ 'is-finish' ]
@@ -270,6 +239,7 @@ if __name__ == "__main__":
 GET /?request=GetCapabilities HTTP/1.1
 Host: localhost
 User-Agent: Mozilla/9.876 (X11; U; Linux 2.2.12-20 i686, en) Gecko/25250101 Netscape/5.432b1
+
 """
 
 # ������ �����
@@ -277,6 +247,7 @@ User-Agent: Mozilla/9.876 (X11; U; Linux 2.2.12-20 i686, en) Gecko/25250101 Nets
 GET /?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&LAYERS=WMS&SRS=EPSG:4326&STYLES=,&FORMAT=image/png&TRANSPARENT=TRUE&WIDTH=256&HEIGHT=256&BBOX=-180.00000000,0.00000000,0.00000000,90.00000000 HTTP/1.1
 Host: localhost
 User-Agent: Mozilla
+
 """
 
 #
@@ -286,4 +257,5 @@ User-Agent: JOSM/1.5 (2083 ru) Java/1.6.0_11
 Host: localhost:50007
 Accept: text/html, image/gif, image/jpeg, *; q=.2, */*; q=.2
 Connection: keep-alive
+
 """
